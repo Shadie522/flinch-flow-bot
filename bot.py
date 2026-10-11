@@ -180,7 +180,7 @@ def check_higher_timeframe_trend(symbol, direction):
             return True
     except Exception as e:
         log.warning("Higher timeframe check failed for %s: %s", symbol, e)
-    return True  # Fallback to allow trade if 4h data is temporarily unavailable
+    return True
 
 
 def analyze_pair(pair, symbol):
@@ -224,7 +224,6 @@ def analyze_pair(pair, symbol):
 
     direction = "BUY" if buy_trend else "SELL"
 
-    # Multi-timeframe confirmation filter
     if not check_higher_timeframe_trend(symbol, direction):
         log.info("Signal for %s filtered out by 4h macro trend.", pair)
         return None
@@ -244,7 +243,6 @@ def analyze_pair(pair, symbol):
         risk = stop - entry
         targets = [entry - risk * multiple for multiple in (3, 4, 5, 6)]
 
-    # Dynamic Position Sizing Calculation
     dollar_risk = ACCOUNT_BALANCE * (RISK_PERCENT / 100.0)
     position_size = dollar_risk / risk if risk > 0 else 0
 
