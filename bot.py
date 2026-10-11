@@ -14,6 +14,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
 
@@ -102,13 +103,10 @@ def is_market_open(pair):
     now = datetime.datetime.now(datetime.timezone.utc)
     weekday = now.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
     
-    # Saturday is fully closed
     if weekday == 5:
         return False
-    # Sunday before 22:00 UTC is closed
     if weekday == 6 and now.hour < 22:
         return False
-    # Friday after 22:00 UTC is closed
     if weekday == 4 and now.hour >= 22:
         return False
         
@@ -198,13 +196,6 @@ def analyze_pair(pair, symbol, interval=DEFAULT_INTERVAL):
     current = df.iloc[-1]
     previous = df.iloc[-4]
 
-    candle_time = str(current["datetime"])
-    cache_key = f"{pair}_{interval}"
-    if last_processed.get(cache_key) == candle_time:
-        return None
-
-    last_processed[cache_key] = candle_time
-
     entry = float(current["close"])
     atr = float(current["atr"])
     ema9 = float(current["ema9"])
@@ -235,7 +226,6 @@ def analyze_pair(pair, symbol, interval=DEFAULT_INTERVAL):
 
     direction = "BUY" if buy_trend else "SELL"
 
-    # Enforce macro 4h trend check only for swing timeframes (1h, 4h, 1day)
     if interval in ["1h", "4h", "1day"]:
         if not check_higher_timeframe_trend(symbol, direction):
             log.info("Signal for %s (%s) filtered out by 4h macro trend.", pair, interval)
@@ -256,7 +246,6 @@ def analyze_pair(pair, symbol, interval=DEFAULT_INTERVAL):
         risk = stop - entry
         targets = [entry - risk * multiple for multiple in (3, 4, 5, 6)]
 
-    # Dynamic Position Sizing Calculation
     dollar_risk = ACCOUNT_BALANCE * (RISK_PERCENT / 100.0)
     position_size = dollar_risk / risk if risk > 0 else 0
 
@@ -267,7 +256,7 @@ def analyze_pair(pair, symbol, interval=DEFAULT_INTERVAL):
         "stop": stop,
         "targets": targets,
         "rsi": rsi,
-        "candle_time": candle_time,
+        "candle_time": str(current["datetime"]),
         "interval": interval,
         "dollar_risk": dollar_risk,
         "position_size": position_size,
@@ -304,21 +293,16 @@ def format_signal(signal):
     )
 
 
-async def scan_markets(bot, interval=DEFAULT_INTERVAL, target_pair=None):
+async def scan_markets(bot, interval=DEFAULT_INTERVAL):
     if interval in ["1h", "4h", "1day"] and not check_economic_calendar():
         log.info("Skipping market scan due to high-impact economic news filter.")
         return
 
-    # Filter pairs if a specific target pair was requested
-    pairs_to_scan = {target_pair: PAIRS[target_pair]} if target_pair and target_pair in PAIRS else PAIRS
-
-    for pair, symbol in pairs_to_scan.items():
+    for pair, symbol in PAIRS.items():
         if not is_market_open(pair):
-            log.info("Market is closed for %s (Weekend/Holiday). Skipping scan.", pair)
             continue
         try:
             signal = await asyncio.to_thread(analyze_pair, pair, symbol, interval)
-
             if signal:
                 keyboard = [
                     [
@@ -327,16 +311,11 @@ async def scan_markets(bot, interval=DEFAULT_INTERVAL, target_pair=None):
                     ]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
-
                 await bot.send_message(
                     chat_id=CHANNEL_ID,
                     text=format_signal(signal),
                     reply_markup=reply_markup,
                 )
-                log.info("Signal posted for %s on %s timeframe", pair, interval)
-            else:
-                log.info("No qualifying signal for %s on %s timeframe", pair, interval)
-
         except Exception as error:
             log.error("Analysis failed for %s (%s): %s", pair, interval, error)
 
@@ -367,7 +346,7 @@ async def post_shutdown(application):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Welcome to FLINCH-FLOW Advanced Signals! 📈\n"
-        "Multi-timeframe, market hour filters, and asset selectors are active."
+        "Use /signal to request an on-demand analysis for any market and timeframe."
     )
 
 
@@ -375,12 +354,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "FLINCH-FLOW BOT COMMANDS\n\n"
         "/start - Start bot\n"
-        "/help - Help info\n"
+        "/signal - Interactive on-demand signal generator\n"
         "/pairs - Supported pairs\n"
-        "/scan [timeframe] [pair] - Scan markets (e.g., /scan 5min, /scan 15min EURUSD)\n"
-        "/stats - View recent database signals\n\n"
-        f"Valid timeframes: {', '.join(VALID_INTERVALS)}\n"
-        f"Valid pairs: {', '.join(PAIRS.keys())}"
+        "/stats - View recent database signals"
     )
 
 
@@ -410,30 +386,106 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"Could not retrieve stats: {e}")
 
 
-async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    interval = DEFAULT_INTERVAL
-    target_pair = None
-
-    if context.args:
-        arg1 = context.args[0].lower()
-        if arg1 in VALID_INTERVALS:
-            interval = arg1
-            if len(context.args) > 1:
-                target_pair = context.args[1].upper()
-        else:
-            target_pair = context.args[0].upper()
-
-    if target_pair and target_pair not in PAIRS:
-        await update.effective_message.reply_text(
-            f"❌ Invalid pair. Choose from: {', '.join(PAIRS.keys())}"
-        )
-        return
-
-    pair_text = target_pair if target_pair else "All Markets"
+# --- Interactive Button Workflow for /signal ---
+async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton("BTCUSD", callback_data="pair_BTCUSD"),
+            InlineKeyboardButton("XAUUSD", callback_data="pair_XAUUSD"),
+        ],
+        [
+            InlineKeyboardButton("EURUSD", callback_data="pair_EURUSD"),
+            InlineKeyboardButton("USDJPY", callback_data="pair_USDJPY"),
+        ],
+        [
+            InlineKeyboardButton("ETHUSD", callback_data="pair_ETHUSD"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.effective_message.reply_text(
-        f"⚡ Running scan for **{pair_text}** on timeframe **{interval}**..."
+        "📊 **Select the asset you want a signal for:**",
+        reply_markup=reply_markup
     )
-    await scan_markets(context.bot, interval=interval, target_pair=target_pair)
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data.startswith("pair_"):
+        selected_pair = data.split("_")[1]
+        context.user_data["selected_pair"] = selected_pair
+
+        # Next step: Ask for timeframe
+        keyboard = [
+            [
+                InlineKeyboardButton("1m", callback_data="tf_1min"),
+                InlineKeyboardButton("5m", callback_data="tf_5min"),
+                InlineKeyboardButton("15m", callback_data="tf_15min"),
+            ],
+            [
+                InlineKeyboardButton("30m", callback_data="tf_30min"),
+                InlineKeyboardButton("1h", callback_data="tf_1h"),
+                InlineKeyboardButton("4h", callback_data="tf_4h"),
+            ],
+            [
+                InlineKeyboardButton("1D", callback_data="tf_1day"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            text=f"Selected Asset: **{selected_pair}**\n⏱ **Now select the timeframe:**",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("tf_"):
+        selected_tf = data.split("_")[1]
+        selected_pair = context.user_data.get("selected_pair", "BTCUSD")
+        symbol = PAIRS.get(selected_pair, "BTC/USD")
+
+        # Check market open
+        if not is_market_open(selected_pair):
+            await query.edit_message_text(
+                text=f"❌ Market is currently **CLOSED** for {selected_pair} (Weekend/Holiday hours). No signals available."
+            )
+            return
+
+        await query.edit_message_text(
+            text=f"🔍 Analyzing **{selected_pair}** on **{selected_tf}** timeframe..."
+        )
+
+        try:
+            signal = await asyncio.to_thread(analyze_pair, selected_pair, symbol, selected_tf)
+            if signal:
+                keyboard = [
+                    [
+                        InlineKeyboardButton("📊 View Chart", url=f"https://www.tradingview.com/chart/?symbol={selected_pair}"),
+                        InlineKeyboardButton("✅ Acknowledge", callback_data="ack_signal")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=format_signal(signal),
+                    reply_markup=reply_markup,
+                )
+                await query.edit_message_text(
+                    text=f"✅ Signal found and posted for **{selected_pair}** ({selected_tf})!"
+                )
+            else:
+                await query.edit_message_text(
+                    text=f"ℹ️ No qualifying signal found for **{selected_pair}** on **{selected_tf}** right now. Conditions (EMA/RSI) did not align."
+                )
+        except Exception as e:
+            await query.edit_message_text(
+                text=f"❌ Analysis failed for {selected_pair} ({selected_tf}): {e}"
+            )
+
+    elif data == "ack_signal":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("👍 Signal acknowledged.")
 
 
 def main():
@@ -448,10 +500,11 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("pairs", pairs_command))
-    application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CommandHandler("signal", signal_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-    print("FLINCH-FLOW multi-timeframe bot is starting...")
+    print("FLINCH-FLOW interactive signal bot is starting...")
     application.run_polling()
 
 
