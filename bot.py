@@ -4,7 +4,9 @@ import logging
 import sqlite3
 import requests
 import datetime
+import threading
 import pandas as pd
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
@@ -23,10 +25,9 @@ API_KEY = os.environ["TWELVE_DATA_API_KEY"]
 CHANNEL_ID = -1003737318075
 
 # --- ADMIN CONFIGURATION ---
-ADMIN_TELEGRAM_ID = 6475916836  # <--- REPLACE THIS with your actual numeric Telegram User ID (e.g. from @userinfobot)
-ADMIN_USERNAME = "@YourTelegramHandle"  # Your Telegram username for screenshots/support
+ADMIN_TELEGRAM_ID = 6475916836  # <--- Replace with your numeric ID from @userinfobot
+ADMIN_USERNAME = "@YourTelegramHandle"
 
-# Updated with your M-Pesa number
 PAYMENT_INSTRUCTIONS = (
     "💳 **HOW TO PAY:**\n\n"
     "1. **M-Pesa (Send Money):** **0793295506**\n"
@@ -59,23 +60,43 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-last_processed = {}
+
+# --- RAILWAY HEALTH CHECK SERVER ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Flinch-Flow Bot is running!")
+    def log_message(self, format, *args):
+        return
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
 
 
 def init_db():
     conn = sqlite3.connect("signals.db")
     cursor = conn.cursor()
+    # Drop old table if it lacks the timeframe column to prevent schema mismatch crashes
+    cursor.execute("PRAGMA table_info(signals)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if columns and "timeframe" not in columns:
+        cursor.execute("DROP TABLE signals")
+        conn.commit()
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
             pair TEXT,
+            timeframe TEXT,
             direction TEXT,
             entry REAL,
             stop_loss REAL,
             tp1 REAL,
             rsi REAL,
-            interval TEXT,
             status TEXT
         )
     """)
@@ -94,7 +115,6 @@ def init_db():
 
 
 def check_and_update_user_access(user_id):
-    # --- ADMIN BYPASS: Free and unlimited for you ---
     if user_id == ADMIN_TELEGRAM_ID:
         return True, "👑 **Admin Access:** Unlimited & Free."
 
@@ -151,17 +171,17 @@ def log_signal_to_db(signal):
         conn = sqlite3.connect("signals.db")
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO signals (timestamp, pair, direction, entry, stop_loss, tp1, rsi, interval, status)
+            INSERT INTO signals (timestamp, pair, timeframe, direction, entry, stop_loss, tp1, rsi, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             signal["candle_time"],
             signal["pair"],
+            signal["interval"],
             signal["direction"],
             signal["entry"],
             signal["stop"],
             signal["targets"][0],
             signal["rsi"],
-            signal["interval"],
             "ACTIVE"
         ))
         conn.commit()
@@ -441,7 +461,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         conn = sqlite3.connect("signals.db")
         cursor = conn.cursor()
-        cursor.execute("SELECT timestamp, pair, direction, entry, interval FROM signals ORDER BY id DESC LIMIT 5")
+        # Query using timeframe column
+        cursor.execute("SELECT timestamp, pair, direction, entry, timeframe FROM signals ORDER BY id DESC LIMIT 5")
         rows = cursor.fetchall()
         conn.close()
         
@@ -502,4 +523,121 @@ async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.effective_message.reply_text(
         "💎 **FLINCH-FLOW VIP SUBSCRIPTION PLANS** 💎\n\n"
-        "Unlock professional signals and sniper setups:\n\
+        "Unlock professional signals and sniper setups:\n\n"
+        "• **$6 / mo** — 1 Signal a day\n"
+        "• **$15 / mo** — 4 Signals a day\n"
+        "• **$50** — 4 Months full access\n"
+        "• **$100** — 1 Year full access\n\n"
+        f"{PAYMENT_INSTRUCTIONS}",
+        reply_markup=reply_markup
+    )
+
+
+async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    allowed, message = check_and_update_user_access(user_id)
+
+    if not allowed:
+        keyboard = [[InlineKeyboardButton("💳 View Subscription Plans", callback_data="show_plans")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.effective_message.reply_text(message, reply_markup=reply_markup)
+        return
+
+    await update.effective_message.reply_text(message)
+
+    if context.args and len(context.args) >= 2:
+        pair_input = context.args[0].upper()
+        interval_input = context.args[1].lower()
+
+        pair_key = None
+        for k in PAIRS.keys():
+            if pair_input in k:
+                pair_key = k
+                break
+
+        if not pair_key or pair_key not in PAIRS:
+            await update.effective_message.reply_text(f"❌ Invalid pair. Choose from: {', '.join(PAIRS.keys())}")
+            return
+
+        if interval_input not in VALID_INTERVALS:
+            await update.effective_message.reply_text(f"❌ Invalid timeframe. Choose from: {', '.join(VALID_INTERVALS)}")
+            return
+
+        if not is_market_open(pair_key):
+            await update.effective_message.reply_text(f"❌ Market is currently **CLOSED** for {pair_key} (Weekend/Holiday hours).")
+            return
+
+        await update.effective_message.reply_text(f"🔍 Analyzing **{pair_key}** on **{interval_input}** timeframe...")
+
+        try:
+            symbol = PAIRS[pair_key]
+            signal = await asyncio.to_thread(analyze_pair, pair_key, symbol, interval_input)
+            if signal:
+                keyboard = [
+                    [
+                        InlineKeyboardButton("📊 View Chart", url=f"https://www.tradingview.com/chart/?symbol={pair_key}"),
+                        InlineKeyboardButton("✅ Acknowledge", callback_data="ack_signal")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.effective_message.reply_text(text=format_signal(signal), reply_markup=reply_markup)
+            else:
+                await update.effective_message.reply_text(f"ℹ️ No qualifying signal found for **{pair_key}** on **{interval_input}** right now.")
+        except Exception as e:
+            await update.effective_message.reply_text(f"❌ Analysis failed: {e}")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("BTCUSD", callback_data="pair_BTCUSD"), InlineKeyboardButton("XAUUSD", callback_data="pair_XAUUSD")],
+        [InlineKeyboardButton("EURUSD", callback_data="pair_EURUSD"), InlineKeyboardButton("USDJPY", callback_data="pair_USDJPY")],
+        [InlineKeyboardButton("ETHUSD", callback_data="pair_ETHUSD")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.effective_message.reply_text("📊 **Select the asset you want a signal for:**", reply_markup=reply_markup)
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
+
+    if data == "show_plans":
+        await subscribe_command(query, context)
+        return
+
+    if data.startswith("sub_"):
+        await query.edit_message_text(
+            f"💎 **VIP SUBSCRIPTION**\n\n{PAYMENT_INSTRUCTIONS}\n\n"
+            f"💡 *Tip for Admin:* When a user pays to **0793295506**, get their Telegram User ID and run:\n"
+            f"`/grant <user_id> 1_SIGNAL_DAY 30`"
+        )
+        return
+
+    if data.startswith("pair_"):
+        allowed, message = check_and_update_user_access(user_id)
+        if not allowed:
+            await query.edit_message_text(text=message)
+            return
+
+        selected_pair = data.split("_")[1]
+        context.user_data["selected_pair"] = selected_pair
+
+        keyboard = [
+            [InlineKeyboardButton("1m", callback_data="tf_1min"), InlineKeyboardButton("5m", callback_data="tf_5min"), InlineKeyboardButton("15m", callback_data="tf_15min")],
+            [InlineKeyboardButton("30m", callback_data="tf_30min"), InlineKeyboardButton("1h", callback_data="tf_1h"), InlineKeyboardButton("4h", callback_data="tf_4h")],
+            [InlineKeyboardButton("1D", callback_data="tf_1day")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text=f"Selected Asset: **{selected_pair}**\n⏱ **Now select the timeframe:**", reply_markup=reply_markup, parse_mode="Markdown")
+
+    elif data.startswith("tf_"):
+        selected_tf = data.split("_")[1]
+        selected_pair = context.user_data.get("selected_pair", "BTCUSD")
+        symbol = PAIRS.get(selected_pair, "BTC/USD")
+
+        if not is_market_open(selected_pair):
+            await query.edit_message_text(text=f"❌ Market is currently **CLOSED** for {selected_pair}.")
+            return
+
+        await query.edit_message_text(text=f"🔍 Analyzing **{selected_pair}** on **{selected_tf
