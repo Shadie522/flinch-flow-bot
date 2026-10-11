@@ -26,7 +26,7 @@ CHANNEL_ID = -1003737318075
 
 # --- ADMIN CONFIGURATION ---
 ADMIN_TELEGRAM_ID = 6475916836  # <--- Replace with your numeric ID from @userinfobot
-ADMIN_USERNAME = "@YourTelegramHandle"
+ADMIN_USERNAME = "@t.me/by_shadie"
 
 PAYMENT_INSTRUCTIONS = (
     "💳 **HOW TO PAY:**\n\n"
@@ -79,7 +79,6 @@ def run_health_server():
 def init_db():
     conn = sqlite3.connect("signals.db")
     cursor = conn.cursor()
-    # Drop old table if it lacks the timeframe column to prevent schema mismatch crashes
     cursor.execute("PRAGMA table_info(signals)")
     columns = [col[1] for col in cursor.fetchall()]
     if columns and "timeframe" not in columns:
@@ -461,7 +460,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         conn = sqlite3.connect("signals.db")
         cursor = conn.cursor()
-        # Query using timeframe column
         cursor.execute("SELECT timestamp, pair, direction, entry, timeframe FROM signals ORDER BY id DESC LIMIT 5")
         rows = cursor.fetchall()
         conn.close()
@@ -640,4 +638,53 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(text=f"❌ Market is currently **CLOSED** for {selected_pair}.")
             return
 
-        await query.edit_message_text(text=f"🔍 Analyzing **{selected_pair}** on **{selected_tf
+        await query.edit_message_text(text=f"🔍 Analyzing **{selected_pair}** on **{selected_tf}** timeframe...")
+
+        try:
+            signal = await asyncio.to_thread(analyze_pair, selected_pair, symbol, selected_tf)
+            if signal:
+                keyboard = [
+                    [
+                        InlineKeyboardButton("📊 View Chart", url=f"https://www.tradingview.com/chart/?symbol={selected_pair}"),
+                        InlineKeyboardButton("✅ Acknowledge", callback_data="ack_signal")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await context.bot.send_message(chat_id=query.message.chat_id, text=format_signal(signal), reply_markup=reply_markup)
+                await query.edit_message_text(text=f"✅ Signal found for **{selected_pair}** ({selected_tf})!")
+            else:
+                await query.edit_message_text(text=f"ℹ️ No qualifying signal found for **{selected_pair}** on **{selected_tf}** right now.")
+        except Exception as e:
+            await query.edit_message_text(text=f"❌ Analysis failed for {selected_pair} ({selected_tf}): {e}")
+
+    elif data == "ack_signal":
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("👍 Signal acknowledged.")
+
+
+def main():
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("pairs", pairs_command))
+    application.add_handler(CommandHandler("signal", signal_command))
+    application.add_handler(CommandHandler("subscribe", subscribe_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("grant", grant_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+
+    print("FLINCH-FLOW subscription bot is starting...")
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
