@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import requests
+import datetime
 import pandas as pd
 
 from ta.trend import EMAIndicator
@@ -39,6 +40,27 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 last_processed = {}
+
+
+def is_market_open(pair):
+    # Keep crypto running 24/7
+    if "BTC" in pair or "ETH" in pair:
+        return True
+    
+    now = datetime.datetime.now(datetime.timezone.utc)
+    weekday = now.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
+    
+    # Saturday is fully closed
+    if weekday == 5:
+        return False
+    # Sunday before 22:00 UTC is closed
+    if weekday == 6 and now.hour < 22:
+        return False
+    # Friday after 22:00 UTC is closed
+    if weekday == 4 and now.hour >= 22:
+        return False
+        
+    return True
 
 
 def get_candles(symbol):
@@ -197,6 +219,9 @@ def format_signal(signal):
 
 async def scan_markets(bot):
     for pair, symbol in PAIRS.items():
+        if not is_market_open(pair):
+            log.info("Market is closed for %s. Skipping scan.", pair)
+            continue
         try:
             signal = await asyncio.to_thread(
                 analyze_pair, pair, symbol
