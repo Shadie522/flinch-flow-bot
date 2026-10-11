@@ -14,6 +14,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
 
@@ -21,11 +22,9 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API_KEY = os.environ["TWELVE_DATA_API_KEY"]
 CHANNEL_ID = -1003737318075
 
-# Account & Risk Parameters for Dynamic Sizing
-ACCOUNT_BALANCE = 10000.0  # Base account balance in USD
-RISK_PERCENT = 1.0         # Risk 1% per trade
+ACCOUNT_BALANCE = 10000.0
+RISK_PERCENT = 1.0
 
-# Market-data symbols
 PAIRS = {
     "BTCUSD": "BTC/USD",
     "XAUUSD": "XAU/USD",
@@ -34,8 +33,7 @@ PAIRS = {
     "ETHUSD": "ETH/USD",
 }
 
-INTERVAL = "1h"
-HIGHER_INTERVAL = "4h"
+DEFAULT_INTERVAL = "1h"
 CANDLE_COUNT = 100
 SCAN_SECONDS = 3600
 
@@ -56,6 +54,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
             pair TEXT,
+            timeframe TEXT,
             direction TEXT,
             entry REAL,
             stop_loss REAL,
@@ -73,11 +72,12 @@ def log_signal_to_db(signal):
         conn = sqlite3.connect("signals.db")
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO signals (timestamp, pair, direction, entry, stop_loss, tp1, rsi, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO signals (timestamp, pair, timeframe, direction, entry, stop_loss, tp1, rsi, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             signal["candle_time"],
             signal["pair"],
+            signal["timeframe"],
             signal["direction"],
             signal["entry"],
             signal["stop"],
@@ -106,7 +106,6 @@ def is_market_open(pair):
 
 
 def check_economic_calendar():
-    """Checks for high-impact USD economic events in the current hour window."""
     try:
         today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         response = requests.get(
@@ -126,11 +125,11 @@ def check_economic_calendar():
                         log.info("High-impact economic event detected (%s). Pausing signals.", event.get("event"))
                         return False
     except Exception as e:
-        log.warning("Economic calendar check skipped due to API limitation: %s", e)
+        log.warning("Economic calendar check skipped: %s", e)
     return True
 
 
-def get_candles(symbol, interval=INTERVAL):
+def get_candles(symbol, interval):
     response = requests.get(
         "https://api.twelvedata.com/time_series",
         params={
@@ -169,30 +168,17 @@ def get_candles(symbol, interval=INTERVAL):
     return df.dropna().reset_index(drop=True)
 
 
-def check_higher_timeframe_trend(symbol, direction):
-    """Multi-timeframe confirmation using 4h chart."""
-    try:
-        df_4h = get_candles(symbol, interval=HIGHER_INTERVAL)
-        current_4h = df_4h.iloc[-1]
-        if direction == "BUY" and current_4h["ema9"] > current_4h["ema21"]:
-            return True
-        if direction == "SELL" and current_4h["ema9"] < current_4h["ema21"]:
-            return True
-    except Exception as e:
-        log.warning("Higher timeframe check failed for %s: %s", symbol, e)
-    return True
-
-
-def analyze_pair(pair, symbol):
-    df = get_candles(symbol, interval=INTERVAL)
+def analyze_pair(pair, symbol, interval):
+    df = get_candles(symbol, interval)
     current = df.iloc[-1]
     previous = df.iloc[-4]
 
     candle_time = str(current["datetime"])
-    if last_processed.get(pair) == candle_time:
+    cache_key = f"{pair}_{interval}"
+    if last_processed.get(cache_key) == candle_time:
         return None
 
-    last_processed[pair] = candle_time
+    last_processed[cache_key] = candle_time
 
     entry = float(current["close"])
     atr = float(current["atr"])
@@ -223,11 +209,6 @@ def analyze_pair(pair, symbol):
         return None
 
     direction = "BUY" if buy_trend else "SELL"
-
-    if not check_higher_timeframe_trend(symbol, direction):
-        log.info("Signal for %s filtered out by 4h macro trend.", pair)
-        return None
-
     recent = df.iloc[-10:]
 
     if direction == "BUY":
@@ -248,6 +229,7 @@ def analyze_pair(pair, symbol):
 
     signal = {
         "pair": pair,
+        "timeframe": interval,
         "direction": direction,
         "entry": entry,
         "stop": stop,
@@ -264,16 +246,17 @@ def analyze_pair(pair, symbol):
 
 def format_signal(signal):
     pair = signal["pair"]
+    interval = signal["timeframe"]
     direction = signal["direction"]
     entry = signal["entry"]
     stop = signal["stop"]
     targets = signal["targets"]
 
     return (
-        "🚨 FLINCH-FLOW ADVANCED SIGNAL 🚨\n\n"
+        "🚨 FLINCH-FLOW MULTI-TIMEFRAME SIGNAL 🚨\n\n"
         f"📊 Pair: {pair}\n"
         f"📈 Direction: {direction}\n"
-        f"⏱ Timeframe: {INTERVAL} (4h Trend Confirmed)\n"
+        f"⏱ Timeframe: {interval}\n"
         f"🕯 Candle: {signal['candle_time']}\n\n"
         f"🎯 Entry: {entry:.5f}\n"
         f"🛑 Stop Loss: {stop:.5f}\n\n"
@@ -288,17 +271,18 @@ def format_signal(signal):
     )
 
 
-async def scan_markets(bot):
+async def scan_markets(bot, interval=DEFAULT_INTERVAL):
     if not check_economic_calendar():
         log.info("Skipping market scan due to high-impact economic news filter.")
-        return
+        return 0
 
+    signals_count = 0
     for pair, symbol in PAIRS.items():
         if not is_market_open(pair):
             log.info("Market is closed for %s. Skipping scan.", pair)
             continue
         try:
-            signal = await asyncio.to_thread(analyze_pair, pair, symbol)
+            signal = await asyncio.to_thread(analyze_pair, pair, symbol, interval)
 
             if signal:
                 keyboard = [
@@ -314,17 +298,19 @@ async def scan_markets(bot):
                     text=format_signal(signal),
                     reply_markup=reply_markup,
                 )
-                log.info("Advanced signal posted for %s", pair)
+                signals_count += 1
+                log.info("Signal posted for %s on timeframe %s", pair, interval)
             else:
-                log.info("No qualifying signal for %s", pair)
+                log.info("No qualifying signal for %s on %s", pair, interval)
 
         except Exception as error:
-            log.error("Analysis failed for %s: %s", pair, error)
+            log.error("Analysis failed for %s on %s: %s", pair, interval, error)
+    return signals_count
 
 
 async def automatic_scans(application):
     while True:
-        await scan_markets(application.bot)
+        await scan_markets(application.bot, DEFAULT_INTERVAL)
         await asyncio.sleep(SCAN_SECONDS)
 
 
@@ -347,8 +333,8 @@ async def post_shutdown(application):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "Welcome to FLINCH-FLOW Advanced Signals! 📈\n"
-        "All filters, multi-timeframe analysis, and risk calculators are active."
+        "Welcome to FLINCH-FLOW Multi-Timeframe Signals! 📈\n"
+        "Use /scan to choose a timeframe and request signals."
     )
 
 
@@ -358,7 +344,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - Start bot\n"
         "/help - Help info\n"
         "/pairs - Supported pairs\n"
-        "/scan - Manual market scan\n"
+        "/scan - Choose timeframe & scan markets\n"
         "/stats - View recent database signals"
     )
 
@@ -373,7 +359,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         conn = sqlite3.connect("signals.db")
         cursor = conn.cursor()
-        cursor.execute("SELECT timestamp, pair, direction, entry FROM signals ORDER BY id DESC LIMIT 5")
+        cursor.execute("SELECT timestamp, pair, timeframe, direction, entry FROM signals ORDER BY id DESC LIMIT 5")
         rows = cursor.fetchall()
         conn.close()
         
@@ -383,15 +369,48 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         msg = "📊 **Recent Signals Logged:**\n\n"
         for row in rows:
-            msg += f"• {row[0]} | {row[1]} {row[2]} @ {row[3]}\n"
+            msg += f"• {row[0]} | {row[1]} ({row[2]}) {row[3]} @ {row[4]}\n"
         await update.effective_message.reply_text(msg)
     except Exception as e:
         await update.effective_message.reply_text(f"Could not retrieve stats: {e}")
 
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Manual scan initiated with all filters...")
-    await scan_markets(context.bot)
+    keyboard = [
+        [
+            InlineKeyboardButton("5m", callback_data="scan_5min"),
+            InlineKeyboardButton("15m", callback_data="scan_15min"),
+            InlineKeyboardButton("30m", callback_data="scan_30min"),
+        ],
+        [
+            InlineKeyboardButton("1h", callback_data="scan_1h"),
+            InlineKeyboardButton("4h", callback_data="scan_4h"),
+            InlineKeyboardButton("1D", callback_data="scan_1day"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.effective_message.reply_text(
+        "⏱ **Select Timeframe for Market Scan:**",
+        reply_markup=reply_markup
+    )
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data.startswith("scan_"):
+        interval = data.replace("scan_", "")
+        await query.edit_message_text(text=f"🔄 Scanning markets on **{interval}** timeframe... Please wait.")
+        
+        count = await scan_markets(context.bot, interval)
+        
+        await query.edit_message_text(
+            text=f"✅ Scan completed for **{interval}** timeframe! Found and posted {count} new signal(s) to the channel."
+        )
+    elif data == "ack_signal":
+        await query.answer("Signal acknowledged!", show_alert=True)
 
 
 def main():
@@ -408,8 +427,9 @@ def main():
     application.add_handler(CommandHandler("pairs", pairs_command))
     application.add_handler(CommandHandler("scan", scan_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-    print("FLINCH-FLOW advanced bot is starting...")
+    print("FLINCH-FLOW multi-timeframe bot is starting...")
     application.run_polling()
 
 
