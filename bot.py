@@ -6,9 +6,9 @@ import requests
 import datetime
 import pandas as pd
 
-from ta.trend import EMAIndicator
+from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
-from ta.volatility import AverageTrueRange
+from ta.volatility import AverageTrueRange, BollingerBands
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -114,7 +114,6 @@ def is_market_open(pair):
 
 
 def check_economic_calendar():
-    """Checks for high-impact USD economic events in the current hour window."""
     try:
         today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         response = requests.get(
@@ -131,10 +130,9 @@ def check_economic_calendar():
                     time_str = event.get("time", "00:00")
                     event_hour = int(time_str.split(":")[0])
                     if abs(event_hour - current_hour) <= 1:
-                        log.info("High-impact economic event detected (%s). Pausing signals.", event.get("event"))
                         return False
     except Exception as e:
-        log.warning("Economic calendar check skipped due to API limitation: %s", e)
+        log.warning("Economic calendar check skipped: %s", e)
     return True
 
 
@@ -169,16 +167,23 @@ def get_candles(symbol, interval=DEFAULT_INTERVAL):
     if len(df) < 30:
         raise ValueError("Not enough completed candles")
 
+    # Technical Indicators
     df["ema9"] = EMAIndicator(close=df["close"], window=9).ema_indicator()
     df["ema21"] = EMAIndicator(close=df["close"], window=21).ema_indicator()
     df["rsi"] = RSIIndicator(close=df["close"], window=14).rsi()
     df["atr"] = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14).average_true_range()
+    
+    # MACD & Bollinger Bands Confluence
+    macd = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
+    df["macd_diff"] = macd.macd_diff()
+    
+    bb = BollingerBands(close=df["close"], window=20, window_dev=2)
+    df["bb_mid"] = bb.bollinger_mavg()
 
     return df.dropna().reset_index(drop=True)
 
 
 def check_higher_timeframe_trend(symbol, direction):
-    """Multi-timeframe confirmation using 4h chart."""
     try:
         df_4h = get_candles(symbol, interval=HIGHER_INTERVAL)
         current_4h = df_4h.iloc[-1]
@@ -201,16 +206,20 @@ def analyze_pair(pair, symbol, interval=DEFAULT_INTERVAL):
     ema9 = float(current["ema9"])
     ema21 = float(current["ema21"])
     rsi = float(current["rsi"])
+    macd_diff = float(current["macd_diff"])
 
     if atr <= 0:
         return None
 
+    # Strict multi-indicator confluence rules
     buy_trend = (
         ema9 > ema21
         and current["close"] > ema9
         and current["ema9"] > previous["ema9"]
         and current["ema21"] > previous["ema21"]
         and 52 <= rsi <= 68
+        and macd_diff > 0
+        and current["close"] > current["bb_mid"]
     )
 
     sell_trend = (
@@ -219,6 +228,8 @@ def analyze_pair(pair, symbol, interval=DEFAULT_INTERVAL):
         and current["ema9"] < previous["ema9"]
         and current["ema21"] < previous["ema21"]
         and 32 <= rsi <= 48
+        and macd_diff < 0
+        and current["close"] < current["bb_mid"]
     )
 
     if not buy_trend and not sell_trend:
@@ -228,7 +239,6 @@ def analyze_pair(pair, symbol, interval=DEFAULT_INTERVAL):
 
     if interval in ["1h", "4h", "1day"]:
         if not check_higher_timeframe_trend(symbol, direction):
-            log.info("Signal for %s (%s) filtered out by 4h macro trend.", pair, interval)
             return None
 
     recent = df.iloc[-10:]
@@ -293,43 +303,35 @@ def format_signal(signal):
     )
 
 
-async def scan_markets(bot, interval=DEFAULT_INTERVAL):
-    if interval in ["1h", "4h", "1day"] and not check_economic_calendar():
-        log.info("Skipping market scan due to high-impact economic news filter.")
-        return
-
-    for pair, symbol in PAIRS.items():
-        if not is_market_open(pair):
-            continue
-        try:
-            signal = await asyncio.to_thread(analyze_pair, pair, symbol, interval)
-            if signal:
-                keyboard = [
-                    [
-                        InlineKeyboardButton("📊 View Chart", url=f"https://www.tradingview.com/chart/?symbol={pair}"),
-                        InlineKeyboardButton("✅ Acknowledge", callback_data="ack_signal")
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await bot.send_message(
-                    chat_id=CHANNEL_ID,
-                    text=format_signal(signal),
-                    reply_markup=reply_markup,
-                )
-        except Exception as error:
-            log.error("Analysis failed for %s (%s): %s", pair, interval, error)
-
-
-async def automatic_scans(application):
+async def scan_markets_background(application):
     while True:
-        await scan_markets(application.bot, interval=DEFAULT_INTERVAL)
+        try:
+            if check_economic_calendar():
+                for pair, symbol in PAIRS.items():
+                    if is_market_open(pair):
+                        signal = await asyncio.to_thread(analyze_pair, pair, symbol, DEFAULT_INTERVAL)
+                        if signal:
+                            keyboard = [
+                                [
+                                    InlineKeyboardButton("📊 View Chart", url=f"https://www.tradingview.com/chart/?symbol={pair}"),
+                                    InlineKeyboardButton("✅ Acknowledge", callback_data="ack_signal")
+                                ]
+                            ]
+                            reply_markup = InlineKeyboardMarkup(keyboard)
+                            await application.bot.send_message(
+                                chat_id=CHANNEL_ID,
+                                text=format_signal(signal),
+                                reply_markup=reply_markup,
+                            )
+        except Exception as error:
+            log.error("Background scan error: %s", error)
         await asyncio.sleep(SCAN_SECONDS)
 
 
 async def post_init(application):
     init_db()
     application.bot_data["scan_task"] = asyncio.create_task(
-        automatic_scans(application)
+        scan_markets_background(application)
     )
 
 
@@ -346,7 +348,7 @@ async def post_shutdown(application):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Welcome to FLINCH-FLOW Advanced Signals! 📈\n"
-        "Use /signal to request an on-demand analysis for any market and timeframe."
+        "Type `/signal EURUSD 5min` or `/signal` for interactive options."
     )
 
 
@@ -354,7 +356,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "FLINCH-FLOW BOT COMMANDS\n\n"
         "/start - Start bot\n"
-        "/signal - Interactive on-demand signal generator\n"
+        "/signal [PAIR] [TF] - Request targeted signal (e.g., /signal EURUSD 5min)\n"
         "/pairs - Supported pairs\n"
         "/stats - View recent database signals"
     )
@@ -386,8 +388,63 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"Could not retrieve stats: {e}")
 
 
-# --- Interactive Button Workflow for /signal ---
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args and len(context.args) >= 2:
+        pair_input = context.args[0].upper()
+        interval_input = context.args[1].lower()
+
+        pair_key = None
+        for k in PAIRS.keys():
+            if pair_input in k:
+                pair_key = k
+                break
+
+        if not pair_key or pair_key not in PAIRS:
+            await update.effective_message.reply_text(
+                f"❌ Invalid pair. Choose from: {', '.join(PAIRS.keys())}"
+            )
+            return
+
+        if interval_input not in VALID_INTERVALS:
+            await update.effective_message.reply_text(
+                f"❌ Invalid timeframe. Choose from: {', '.join(VALID_INTERVALS)}"
+            )
+            return
+
+        if not is_market_open(pair_key):
+            await update.effective_message.reply_text(
+                f"❌ Market is currently **CLOSED** for {pair_key} (Weekend/Holiday hours). No signals available."
+            )
+            return
+
+        await update.effective_message.reply_text(
+            f"🔍 Analyzing **{pair_key}** on **{interval_input}** timeframe..."
+        )
+
+        try:
+            symbol = PAIRS[pair_key]
+            signal = await asyncio.to_thread(analyze_pair, pair_key, symbol, interval_input)
+            if signal:
+                keyboard = [
+                    [
+                        InlineKeyboardButton("📊 View Chart", url=f"https://www.tradingview.com/chart/?symbol={pair_key}"),
+                        InlineKeyboardButton("✅ Acknowledge", callback_data="ack_signal")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.effective_message.reply_text(
+                    text=format_signal(signal),
+                    reply_markup=reply_markup
+                )
+            else:
+                await update.effective_message.reply_text(
+                    f"ℹ️ No qualifying signal found for **{pair_key}** on **{interval_input}** right now. Confluence conditions did not align."
+                )
+        except Exception as e:
+            await update.effective_message.reply_text(f"❌ Analysis failed: {e}")
+        return
+
+    # Interactive button menu if no arguments given
     keyboard = [
         [
             InlineKeyboardButton("BTCUSD", callback_data="pair_BTCUSD"),
@@ -403,7 +460,8 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.effective_message.reply_text(
-        "📊 **Select the asset you want a signal for:**",
+        "📊 **Select the asset you want a signal for:**\n"
+        "*(Or type directly: `/signal EURUSD 5min`)*",
         reply_markup=reply_markup
     )
 
@@ -417,7 +475,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         selected_pair = data.split("_")[1]
         context.user_data["selected_pair"] = selected_pair
 
-        # Next step: Ask for timeframe
         keyboard = [
             [
                 InlineKeyboardButton("1m", callback_data="tf_1min"),
@@ -445,7 +502,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         selected_pair = context.user_data.get("selected_pair", "BTCUSD")
         symbol = PAIRS.get(selected_pair, "BTC/USD")
 
-        # Check market open
         if not is_market_open(selected_pair):
             await query.edit_message_text(
                 text=f"❌ Market is currently **CLOSED** for {selected_pair} (Weekend/Holiday hours). No signals available."
@@ -472,11 +528,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=reply_markup,
                 )
                 await query.edit_message_text(
-                    text=f"✅ Signal found and posted for **{selected_pair}** ({selected_tf})!"
+                    text=f"✅ Signal check completed for **{selected_pair}** ({selected_tf})!"
                 )
             else:
                 await query.edit_message_text(
-                    text=f"ℹ️ No qualifying signal found for **{selected_pair}** on **{selected_tf}** right now. Conditions (EMA/RSI) did not align."
+                    text=f"ℹ️ No qualifying signal found for **{selected_pair}** on **{selected_tf}** right now. Confluence conditions did not align."
                 )
         except Exception as e:
             await query.edit_message_text(
@@ -504,7 +560,7 @@ def main():
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    print("FLINCH-FLOW interactive signal bot is starting...")
+    print("FLINCH-FLOW final optimized signal bot is starting...")
     application.run_polling()
 
 
