@@ -14,7 +14,6 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
 )
 
@@ -22,9 +21,11 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API_KEY = os.environ["TWELVE_DATA_API_KEY"]
 CHANNEL_ID = -1003737318075
 
-ACCOUNT_BALANCE = 10000.0
-RISK_PERCENT = 1.0
+# Account & Risk Parameters for Dynamic Sizing
+ACCOUNT_BALANCE = 10000.0  # Base account balance in USD
+RISK_PERCENT = 1.0         # Risk 1% per trade
 
+# Market-data symbols
 PAIRS = {
     "BTCUSD": "BTC/USD",
     "XAUUSD": "XAU/USD",
@@ -34,8 +35,10 @@ PAIRS = {
 }
 
 DEFAULT_INTERVAL = "1h"
+HIGHER_INTERVAL = "4h"
 CANDLE_COUNT = 100
 SCAN_SECONDS = 3600
+VALID_INTERVALS = ["1min", "5min", "15min", "30min", "1h", "4h", "1day"]
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
@@ -54,12 +57,12 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
             pair TEXT,
-            timeframe TEXT,
             direction TEXT,
             entry REAL,
             stop_loss REAL,
             tp1 REAL,
             rsi REAL,
+            interval TEXT,
             status TEXT
         )
     """)
@@ -72,17 +75,17 @@ def log_signal_to_db(signal):
         conn = sqlite3.connect("signals.db")
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO signals (timestamp, pair, timeframe, direction, entry, stop_loss, tp1, rsi, status)
+            INSERT INTO signals (timestamp, pair, direction, entry, stop_loss, tp1, rsi, interval, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             signal["candle_time"],
             signal["pair"],
-            signal["timeframe"],
             signal["direction"],
             signal["entry"],
             signal["stop"],
             signal["targets"][0],
             signal["rsi"],
+            signal["interval"],
             "ACTIVE"
         ))
         conn.commit()
@@ -92,20 +95,28 @@ def log_signal_to_db(signal):
 
 
 def is_market_open(pair):
+    """Returns True if the market is open, False if closed (weekends for Forex/Gold)."""
     if "BTC" in pair or "ETH" in pair:
-        return True
+        return True  # Crypto is 24/7
+    
     now = datetime.datetime.now(datetime.timezone.utc)
-    weekday = now.weekday()
+    weekday = now.weekday()  # 0=Mon, 4=Fri, 5=Sat, 6=Sun
+    
+    # Saturday is fully closed
     if weekday == 5:
         return False
+    # Sunday before 22:00 UTC is closed
     if weekday == 6 and now.hour < 22:
         return False
+    # Friday after 22:00 UTC is closed
     if weekday == 4 and now.hour >= 22:
         return False
+        
     return True
 
 
 def check_economic_calendar():
+    """Checks for high-impact USD economic events in the current hour window."""
     try:
         today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         response = requests.get(
@@ -125,11 +136,11 @@ def check_economic_calendar():
                         log.info("High-impact economic event detected (%s). Pausing signals.", event.get("event"))
                         return False
     except Exception as e:
-        log.warning("Economic calendar check skipped: %s", e)
+        log.warning("Economic calendar check skipped due to API limitation: %s", e)
     return True
 
 
-def get_candles(symbol, interval):
+def get_candles(symbol, interval=DEFAULT_INTERVAL):
     response = requests.get(
         "https://api.twelvedata.com/time_series",
         params={
@@ -168,8 +179,22 @@ def get_candles(symbol, interval):
     return df.dropna().reset_index(drop=True)
 
 
-def analyze_pair(pair, symbol, interval):
-    df = get_candles(symbol, interval)
+def check_higher_timeframe_trend(symbol, direction):
+    """Multi-timeframe confirmation using 4h chart."""
+    try:
+        df_4h = get_candles(symbol, interval=HIGHER_INTERVAL)
+        current_4h = df_4h.iloc[-1]
+        if direction == "BUY" and current_4h["ema9"] > current_4h["ema21"]:
+            return True
+        if direction == "SELL" and current_4h["ema9"] < current_4h["ema21"]:
+            return True
+    except Exception as e:
+        log.warning("Higher timeframe check failed for %s: %s", symbol, e)
+    return True
+
+
+def analyze_pair(pair, symbol, interval=DEFAULT_INTERVAL):
+    df = get_candles(symbol, interval=interval)
     current = df.iloc[-1]
     previous = df.iloc[-4]
 
@@ -209,6 +234,13 @@ def analyze_pair(pair, symbol, interval):
         return None
 
     direction = "BUY" if buy_trend else "SELL"
+
+    # Enforce macro 4h trend check only for swing timeframes (1h, 4h, 1day)
+    if interval in ["1h", "4h", "1day"]:
+        if not check_higher_timeframe_trend(symbol, direction):
+            log.info("Signal for %s (%s) filtered out by 4h macro trend.", pair, interval)
+            return None
+
     recent = df.iloc[-10:]
 
     if direction == "BUY":
@@ -224,18 +256,19 @@ def analyze_pair(pair, symbol, interval):
         risk = stop - entry
         targets = [entry - risk * multiple for multiple in (3, 4, 5, 6)]
 
+    # Dynamic Position Sizing Calculation
     dollar_risk = ACCOUNT_BALANCE * (RISK_PERCENT / 100.0)
     position_size = dollar_risk / risk if risk > 0 else 0
 
     signal = {
         "pair": pair,
-        "timeframe": interval,
         "direction": direction,
         "entry": entry,
         "stop": stop,
         "targets": targets,
         "rsi": rsi,
         "candle_time": candle_time,
+        "interval": interval,
         "dollar_risk": dollar_risk,
         "position_size": position_size,
     }
@@ -246,14 +279,14 @@ def analyze_pair(pair, symbol, interval):
 
 def format_signal(signal):
     pair = signal["pair"]
-    interval = signal["timeframe"]
     direction = signal["direction"]
     entry = signal["entry"]
     stop = signal["stop"]
     targets = signal["targets"]
+    interval = signal["interval"]
 
     return (
-        "🚨 FLINCH-FLOW MULTI-TIMEFRAME SIGNAL 🚨\n\n"
+        f"🚨 FLINCH-FLOW {interval.upper()} SIGNAL 🚨\n\n"
         f"📊 Pair: {pair}\n"
         f"📈 Direction: {direction}\n"
         f"⏱ Timeframe: {interval}\n"
@@ -271,15 +304,17 @@ def format_signal(signal):
     )
 
 
-async def scan_markets(bot, interval=DEFAULT_INTERVAL):
-    if not check_economic_calendar():
+async def scan_markets(bot, interval=DEFAULT_INTERVAL, target_pair=None):
+    if interval in ["1h", "4h", "1day"] and not check_economic_calendar():
         log.info("Skipping market scan due to high-impact economic news filter.")
-        return 0
+        return
 
-    signals_count = 0
-    for pair, symbol in PAIRS.items():
+    # Filter pairs if a specific target pair was requested
+    pairs_to_scan = {target_pair: PAIRS[target_pair]} if target_pair and target_pair in PAIRS else PAIRS
+
+    for pair, symbol in pairs_to_scan.items():
         if not is_market_open(pair):
-            log.info("Market is closed for %s. Skipping scan.", pair)
+            log.info("Market is closed for %s (Weekend/Holiday). Skipping scan.", pair)
             continue
         try:
             signal = await asyncio.to_thread(analyze_pair, pair, symbol, interval)
@@ -298,19 +333,17 @@ async def scan_markets(bot, interval=DEFAULT_INTERVAL):
                     text=format_signal(signal),
                     reply_markup=reply_markup,
                 )
-                signals_count += 1
-                log.info("Signal posted for %s on timeframe %s", pair, interval)
+                log.info("Signal posted for %s on %s timeframe", pair, interval)
             else:
-                log.info("No qualifying signal for %s on %s", pair, interval)
+                log.info("No qualifying signal for %s on %s timeframe", pair, interval)
 
         except Exception as error:
-            log.error("Analysis failed for %s on %s: %s", pair, interval, error)
-    return signals_count
+            log.error("Analysis failed for %s (%s): %s", pair, interval, error)
 
 
 async def automatic_scans(application):
     while True:
-        await scan_markets(application.bot, DEFAULT_INTERVAL)
+        await scan_markets(application.bot, interval=DEFAULT_INTERVAL)
         await asyncio.sleep(SCAN_SECONDS)
 
 
@@ -333,8 +366,8 @@ async def post_shutdown(application):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "Welcome to FLINCH-FLOW Multi-Timeframe Signals! 📈\n"
-        "Use /scan to choose a timeframe and request signals."
+        "Welcome to FLINCH-FLOW Advanced Signals! 📈\n"
+        "Multi-timeframe, market hour filters, and asset selectors are active."
     )
 
 
@@ -344,8 +377,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - Start bot\n"
         "/help - Help info\n"
         "/pairs - Supported pairs\n"
-        "/scan - Choose timeframe & scan markets\n"
-        "/stats - View recent database signals"
+        "/scan [timeframe] [pair] - Scan markets (e.g., /scan 5min, /scan 15min EURUSD)\n"
+        "/stats - View recent database signals\n\n"
+        f"Valid timeframes: {', '.join(VALID_INTERVALS)}\n"
+        f"Valid pairs: {', '.join(PAIRS.keys())}"
     )
 
 
@@ -359,7 +394,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         conn = sqlite3.connect("signals.db")
         cursor = conn.cursor()
-        cursor.execute("SELECT timestamp, pair, timeframe, direction, entry FROM signals ORDER BY id DESC LIMIT 5")
+        cursor.execute("SELECT timestamp, pair, direction, entry, interval FROM signals ORDER BY id DESC LIMIT 5")
         rows = cursor.fetchall()
         conn.close()
         
@@ -369,48 +404,36 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         msg = "📊 **Recent Signals Logged:**\n\n"
         for row in rows:
-            msg += f"• {row[0]} | {row[1]} ({row[2]}) {row[3]} @ {row[4]}\n"
+            msg += f"• {row[0]} | {row[1]} {row[2]} @ {row[3]} ({row[4]})\n"
         await update.effective_message.reply_text(msg)
     except Exception as e:
         await update.effective_message.reply_text(f"Could not retrieve stats: {e}")
 
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [
-            InlineKeyboardButton("5m", callback_data="scan_5min"),
-            InlineKeyboardButton("15m", callback_data="scan_15min"),
-            InlineKeyboardButton("30m", callback_data="scan_30min"),
-        ],
-        [
-            InlineKeyboardButton("1h", callback_data="scan_1h"),
-            InlineKeyboardButton("4h", callback_data="scan_4h"),
-            InlineKeyboardButton("1D", callback_data="scan_1day"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.effective_message.reply_text(
-        "⏱ **Select Timeframe for Market Scan:**",
-        reply_markup=reply_markup
-    )
+    interval = DEFAULT_INTERVAL
+    target_pair = None
 
+    if context.args:
+        arg1 = context.args[0].lower()
+        if arg1 in VALID_INTERVALS:
+            interval = arg1
+            if len(context.args) > 1:
+                target_pair = context.args[1].upper()
+        else:
+            target_pair = context.args[0].upper()
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    if data.startswith("scan_"):
-        interval = data.replace("scan_", "")
-        await query.edit_message_text(text=f"🔄 Scanning markets on **{interval}** timeframe... Please wait.")
-        
-        count = await scan_markets(context.bot, interval)
-        
-        await query.edit_message_text(
-            text=f"✅ Scan completed for **{interval}** timeframe! Found and posted {count} new signal(s) to the channel."
+    if target_pair and target_pair not in PAIRS:
+        await update.effective_message.reply_text(
+            f"❌ Invalid pair. Choose from: {', '.join(PAIRS.keys())}"
         )
-    elif data == "ack_signal":
-        await query.answer("Signal acknowledged!", show_alert=True)
+        return
+
+    pair_text = target_pair if target_pair else "All Markets"
+    await update.effective_message.reply_text(
+        f"⚡ Running scan for **{pair_text}** on timeframe **{interval}**..."
+    )
+    await scan_markets(context.bot, interval=interval, target_pair=target_pair)
 
 
 def main():
@@ -427,7 +450,6 @@ def main():
     application.add_handler(CommandHandler("pairs", pairs_command))
     application.add_handler(CommandHandler("scan", scan_command))
     application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CallbackQueryHandler(button_handler))
 
     print("FLINCH-FLOW multi-timeframe bot is starting...")
     application.run_polling()
